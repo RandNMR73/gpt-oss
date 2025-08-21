@@ -20,6 +20,18 @@ from triton_kernels.tensor import convert_layout
 from triton_kernels.tensor_details.layout import StridedLayout, HopperMXValueLayout
 from triton_kernels.tensor import wrap_torch_tensor, FP4
 
+import importlib, sys as _sys
+
+# --- Begin compatibility patch for some Triton builds missing __version__/knobs ---
+_triton = importlib.import_module("triton")
+if not hasattr(_triton, "__version__"):
+    setattr(_triton, "__version__", "0.0.0")
+if not hasattr(_triton, "knobs"):
+    setattr(_triton, "knobs", {})
+# Re-export on the triton module to satisfy `from triton import __version__, knobs`.
+_sys.modules["triton"] = _triton
+# --- End compatibility patch ---
+
 
 def quantize_mx4(w):
     """Quantize weights to MXFP4 format."""
