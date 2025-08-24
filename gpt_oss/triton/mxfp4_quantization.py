@@ -22,17 +22,6 @@ from triton_kernels.tensor import wrap_torch_tensor, FP4
 
 import importlib, sys as _sys
 
-# --- Begin compatibility patch for some Triton builds missing __version__/knobs ---
-_triton = importlib.import_module("triton")
-if not hasattr(_triton, "__version__"):
-    setattr(_triton, "__version__", "0.0.0")
-if not hasattr(_triton, "knobs"):
-    setattr(_triton, "knobs", {})
-# Re-export on the triton module to satisfy `from triton import __version__, knobs`.
-_sys.modules["triton"] = _triton
-# --- End compatibility patch ---
-
-
 def quantize_mx4(w):
     """Quantize weights to MXFP4 format."""
     w, w_scale = downcast_to_mxfp(w.to(torch.bfloat16), torch.uint8, axis=1)
@@ -53,9 +42,13 @@ class MXFP4Linear(nn.Module):
         self.in_features = in_features
         self.out_features = out_features
         
-        # Create weight parameter
-        self.weight = nn.Parameter(torch.empty(out_features, in_features, 
-                                             dtype=torch.bfloat16, device=device))
+        # Create weight parameter in column-major format (in_features, out_features)
+        # This matches the layout expected by matmul_ogs for MXFP4
+        self._weight = nn.Parameter(torch.empty(
+            (in_features, out_features),  # Note: transposed from standard Linear
+            dtype=torch.bfloat16, 
+            device=device
+        ))
         
         # Create bias parameter if requested
         if bias:
@@ -66,28 +59,41 @@ class MXFP4Linear(nn.Module):
         # Initialize weights
         self.reset_parameters()
         
-        # Quantized weight and scale (will be set during forward pass)
-        self.quantized_weight = None
-        self.weight_scale = None
-        self._quantized = False
+        # Setup quantized weight structures
+        self._update_quantized_weights()
     
     def reset_parameters(self):
         """Initialize weights using Xavier initialization."""
-        nn.init.xavier_uniform_(self.weight)
+        # Note: we need to transpose for initialization since we store weights transposed
+        with torch.no_grad():
+            init_weight = torch.empty_like(self._weight.mT)
+            nn.init.xavier_uniform_(init_weight)
+            self._weight.copy_(init_weight.mT)
+            
         if self.bias is not None:
             nn.init.zeros_(self.bias)
     
-    def _quantize_weights(self):
-        """Quantize weights to MXFP4 format."""
-        if not self._quantized:
-            self.quantized_weight, self.weight_scale = quantize_mx4(self.weight)
-            self._quantized = True
+    def _update_quantized_weights(self):
+        """Update quantized weight structures when weight changes."""
+        # Weight is already in column-major format (in_features, out_features)
+        self.quantized_weight_tensor, self.weight_scale = quantize_mx4(self._weight)
+    
+    @property
+    def weight(self):
+        """Return weight tensor in standard format for compatibility."""
+        return self._weight.mT  # Convert to standard Linear format
+    
+    @weight.setter  
+    def weight(self, value):
+        """Set weight tensor and update quantized representation."""
+        with torch.no_grad():
+            # Convert from standard Linear format to our column-major storage
+            self._weight.copy_(value.mT)
+            # Re-quantize with new weights
+            self._update_quantized_weights()
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass with MXFP4 quantized weights."""
-        if not self._quantized:
-            self._quantize_weights()
-        
         # Ensure input is bfloat16
         if x.dtype != torch.bfloat16:
             x = x.to(torch.bfloat16)
@@ -96,8 +102,10 @@ class MXFP4Linear(nn.Module):
         pc = PrecisionConfig(weight_scale=self.weight_scale, 
                            flex_ctx=FlexCtx(rhs_data=InFlexData()))
         
+        print(f"quantized weight tensor stride: {self.quantized_weight_tensor.stride()}")
+        
         # Perform quantized matrix multiplication
-        output = matmul_ogs(x, self.quantized_weight, self.bias, precision_config=pc)
+        output = matmul_ogs(x, self.quantized_weight_tensor, self.bias, precision_config=pc)
         
         return output
 
@@ -117,9 +125,13 @@ class MXFP4LinearWithActivation(nn.Module):
         self.activation = activation
         self.swiglu_limit = swiglu_limit
         
-        # Create weight parameter
-        self.weight = nn.Parameter(torch.empty(out_features, in_features, 
-                                             dtype=torch.bfloat16, device=device))
+        # Create weight parameter in column-major format (in_features, out_features)
+        # This matches the layout expected by matmul_ogs for MXFP4
+        self._weight = nn.Parameter(torch.empty(
+            (in_features, out_features),  # Note: transposed from standard Linear
+            dtype=torch.bfloat16, 
+            device=device
+        ))
         
         # Create bias parameter if requested
         if bias:
@@ -130,28 +142,41 @@ class MXFP4LinearWithActivation(nn.Module):
         # Initialize weights
         self.reset_parameters()
         
-        # Quantized weight and scale (will be set during forward pass)
-        self.quantized_weight = None
-        self.weight_scale = None
-        self._quantized = False
+        # Setup quantized weight structures
+        self._update_quantized_weights()
     
     def reset_parameters(self):
         """Initialize weights using Xavier initialization."""
-        nn.init.xavier_uniform_(self.weight)
+        # Note: we need to transpose for initialization since we store weights transposed
+        with torch.no_grad():
+            init_weight = torch.empty_like(self._weight.mT)
+            nn.init.xavier_uniform_(init_weight)
+            self._weight.copy_(init_weight.mT)
+            
         if self.bias is not None:
             nn.init.zeros_(self.bias)
     
-    def _quantize_weights(self):
-        """Quantize weights to MXFP4 format."""
-        if not self._quantized:
-            self.quantized_weight, self.weight_scale = quantize_mx4(self.weight)
-            self._quantized = True
+    def _update_quantized_weights(self):
+        """Update quantized weight structures when weight changes."""
+        # Weight is already in column-major format (in_features, out_features)
+        self.quantized_weight_tensor, self.weight_scale = quantize_mx4(self._weight)
+    
+    @property
+    def weight(self):
+        """Return weight tensor in standard format for compatibility."""
+        return self._weight.mT  # Convert to standard Linear format
+    
+    @weight.setter  
+    def weight(self, value):
+        """Set weight tensor and update quantized representation."""
+        with torch.no_grad():
+            # Convert from standard Linear format to our column-major storage
+            self._weight.copy_(value.mT)
+            # Re-quantize with new weights
+            self._update_quantized_weights()
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass with MXFP4 quantized weights and activation."""
-        if not self._quantized:
-            self._quantize_weights()
-        
         # Ensure input is bfloat16
         if x.dtype != torch.bfloat16:
             x = x.to(torch.bfloat16)
@@ -166,11 +191,11 @@ class MXFP4LinearWithActivation(nn.Module):
                 FnSpecs("swiglu", triton_kernels.swiglu.swiglu_fn, ("alpha", "limit")), 
                 (1.702, self.swiglu_limit), 2
             )
-            output = matmul_ogs(x, self.quantized_weight, self.bias, 
+            output = matmul_ogs(x, self.quantized_weight_tensor, self.bias, 
                                precision_config=pc, fused_activation=act)
         else:
             # No activation
-            output = matmul_ogs(x, self.quantized_weight, self.bias, precision_config=pc)
+            output = matmul_ogs(x, self.quantized_weight_tensor, self.bias, precision_config=pc)
         
         return output
 
